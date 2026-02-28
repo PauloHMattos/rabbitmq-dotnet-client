@@ -31,35 +31,86 @@
 
 using System;
 using System.Buffers;
+using System.Diagnostics;
+using static RabbitMQ.Client.Impl.Framing;
 
 namespace RabbitMQ.Client
 {
     internal struct OutgoingFrameMemory : IDisposable
     {
-        internal OutgoingFrameMemory(IMemoryOwner<byte> memoryOwner, int length)
+        private byte[]? _methodAndHeader;
+        private readonly int _methodAndHeaderLength;
+        private ReadOnlyMemory<byte> _body;
+        private readonly int _maxBodyPayloadBytes;
+        private readonly ushort _channelNumber;
+
+        internal OutgoingFrameMemory(
+            byte[] methodAndHeader,
+            int methodAndHeaderLength)
         {
-            _memory = memoryOwner.Memory.Slice(0, length);
-            _memoryOwner = memoryOwner;
+            _methodAndHeader = methodAndHeader;
+            _methodAndHeaderLength = methodAndHeaderLength;
+            _body = default;
+            _channelNumber = 0;
+            _maxBodyPayloadBytes = 0;
+            Size = methodAndHeaderLength;
         }
 
-        internal readonly int Size => _memory.Length;
-
-        private ReadOnlyMemory<byte> _memory;
-        private IMemoryOwner<byte>? _memoryOwner;
-
-        internal readonly void WriteTo(IBufferWriter<byte> pipeWriter)
+        internal OutgoingFrameMemory(
+            byte[] methodAndHeader,
+            int methodAndHeaderLength,
+            ReadOnlyMemory<byte> body,
+            ushort channelNumber,
+            int maxBodyPayloadBytes,
+            int totalSize)
         {
-            pipeWriter.Write(_memory.Span);
+            _methodAndHeader = methodAndHeader;
+            _methodAndHeaderLength = methodAndHeaderLength;
+            _body = body;
+            _channelNumber = channelNumber;
+            _maxBodyPayloadBytes = maxBodyPayloadBytes;
+            Size = totalSize;
+        }
+
+        internal readonly int Size { get; }
+
+        internal readonly void WriteTo(IBufferWriter<byte> writer)
+        {
+            Debug.Assert(_methodAndHeader is not null);
+            ReadOnlySpan<byte> methodAndHeader = _methodAndHeader!.AsSpan(0, _methodAndHeaderLength);
+            writer.Write(methodAndHeader);
+            
+            if (_body.Length == 0)
+            {
+                return;
+            }
+
+            ReadOnlySpan<byte> bodySpan = _body!.Span;
+            int remainingBodyBytes = bodySpan.Length;
+            int bodyOffset = 0;
+
+            while (remainingBodyBytes > 0)
+            {
+                int payloadSize = remainingBodyBytes > _maxBodyPayloadBytes ? _maxBodyPayloadBytes : remainingBodyBytes;
+
+                Span<byte> span = writer.GetSpan(BodySegment.HeaderSize + payloadSize + BodySegment.FooterSize);
+                int offset = BodySegment.WriteTo(span, _channelNumber, bodySpan.Slice(bodyOffset, payloadSize));
+                writer.Advance(offset);
+
+                remainingBodyBytes -= payloadSize;
+                bodyOffset += payloadSize;
+            }
         }
 
         public void Dispose()
         {
-            IMemoryOwner<byte>? memoryOwner = _memoryOwner;
-            _memoryOwner = null;
-            if (memoryOwner != null)
+            byte[]? methodAndHeader = _methodAndHeader;
+            _methodAndHeader = null;
+            if (methodAndHeader != null)
             {
-                memoryOwner.Dispose();
-                _memory = default;
+                ArrayPool<byte>.Shared.Return(methodAndHeader);
+                _methodAndHeader = default;
+                _body = default;
             }
         }
     }
