@@ -47,8 +47,8 @@ namespace RabbitMQ.Client.Impl
         private readonly ITcpClient _socket;
         private readonly Stream _stream;
 
-        private readonly ChannelWriter<OutgoingFrameMemory> _channelWriter;
-        private readonly ChannelReader<OutgoingFrameMemory> _channelReader;
+        private readonly ChannelWriter<(OutgoingFrameMemory, TaskCompletionSource<object?>)> _channelWriter;
+        private readonly ChannelReader<(OutgoingFrameMemory, TaskCompletionSource<object?>)> _channelReader;
         private readonly SemaphoreSlim _closingSemaphore = new SemaphoreSlim(1, 1);
 
         private readonly PipeWriter _pipeWriter;
@@ -65,7 +65,7 @@ namespace RabbitMQ.Client.Impl
             _socket = socket;
             _stream = stream;
 
-            var channel = System.Threading.Channels.Channel.CreateBounded<OutgoingFrameMemory>(
+            var channel = System.Threading.Channels.Channel.CreateBounded<(OutgoingFrameMemory, TaskCompletionSource<object?>)>(
                 new BoundedChannelOptions(128)
                 {
                     AllowSynchronousContinuations = false,
@@ -229,15 +229,17 @@ namespace RabbitMQ.Client.Impl
                 .ConfigureAwait(false);
         }
 
-        public ValueTask WriteAsync(OutgoingFrameMemory frames, CancellationToken cancellationToken)
+        public async ValueTask WriteAsync(OutgoingFrameMemory frames, CancellationToken cancellationToken)
         {
             if (_closed)
             {
                 frames.Dispose();
-                return default;
+                return;
             }
 
-            return _channelWriter.WriteAsync(frames, cancellationToken);
+            var tcs = new TaskCompletionSource<object?>(TaskCreationOptions.RunContinuationsAsynchronously);
+            await _channelWriter.WriteAsync((frames, tcs), cancellationToken).ConfigureAwait(false);
+            await tcs.Task.ConfigureAwait(false);
         }
 
         private async Task WriteLoopAsync()
@@ -246,8 +248,9 @@ namespace RabbitMQ.Client.Impl
             {
                 while (await _channelReader.WaitToReadAsync().ConfigureAwait(false))
                 {
-                    while (_channelReader.TryRead(out OutgoingFrameMemory frames))
+                    while (_channelReader.TryRead(out (OutgoingFrameMemory, TaskCompletionSource<object?>) data))
                     {
+                        (OutgoingFrameMemory frames, TaskCompletionSource<object?>? tcs) = data;
                         try
                         {
                             frames.WriteTo(_pipeWriter);
@@ -257,6 +260,7 @@ namespace RabbitMQ.Client.Impl
                         finally
                         {
                             frames.Dispose();
+                            tcs.SetResult(null);
                         }
                     }
 
